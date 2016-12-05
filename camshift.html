@@ -1,0 +1,509 @@
+<!doctype html>
+
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+    <meta name="description" content="A JavaScript Computer Vision Library">
+    <meta name="author" content="Eugene Zatepyakin">
+    <title>JSFeat - JavaScript Computer Vision Library.</title>
+
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Droid+Sans:regular,bold|Inconsolata|PT+Sans:400,700">
+    <link rel="stylesheet" href="css/bootstrap.css">
+    <link rel="stylesheet" href="css/jsfeat.css">
+</head>
+<body>
+    <video id="webcam" width="640" height="480" style="display:none;"></video>
+    <div style=" width:640px;height:480px;margin: 10px auto;">
+        <canvas id="canvas" width="640" height="480"></canvas>
+        <div id="no_rtc" class="alert alert-error" style="display:none;"></div>
+        <div id="log" class="alert alert-info"></div>
+    </div>
+
+    <script type="text/javascript" src="https://ajax.googleapis.com/ajax/libs/jquery/1.8.2/jquery.min.js"></script>
+    <script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/jsfeat/0.0.8/jsfeat-min.js"></script>
+    <script type="text/javascript" src="https://inspirit.github.io/jsfeat/js/bbf_face.js"></script>
+    <script type="text/javascript" src="js/lib/camshift.js"></script>
+    <script type="text/javascript" src="js/lib/compatibility.js"></script>
+    <script type="text/javascript" src="js/lib/profiler.js"></script>
+    <script type="text/javascript">
+
+    $(window).load(function() {
+        "use strict";
+
+        var options = {};
+        var demo_opt = function() {
+            //detector
+            this.min_scale = 2;
+            this.scale_factor = 1.15;
+            this.equalize_histogram = false;
+            this.use_canny = true;
+            this.edges_density = 0.13;
+
+            //points
+            this.points_per_face = 20;
+            this.show_track_pts = false;
+
+            //tracker
+            this.win_size = 20;
+            this.max_iterations = 30;
+            this.epsilon = 0.01;
+            this.min_eigen = 0.001;
+
+            //misc
+            this.detector = 'BBF';
+            this.detects_interval = 1000; //time in millis between detection (in that interval tracking is used on existing faces)
+        };
+
+        //interest point variables
+        var corners_img_u8, corners;
+        //tracking variables
+        var curr_img_pyr, prev_img_pyr, point_count, point_status, prev_xy, curr_xy;
+        var MAX_POINTS = 500;
+
+
+        // lets do some fun
+        var video = document.getElementById('webcam');
+        var canvas = document.getElementById('canvas');
+
+        //load image
+        var bodyImg = document.createElement('img');
+        bodyImg.src = 'img/arnold_body.png';
+
+
+        try {
+            var attempts = 0;
+            var readyListener = function(event) {
+                findVideoSize();
+            };
+            var findVideoSize = function() {
+                if(video.videoWidth > 0 && video.videoHeight > 0) {
+                    video.removeEventListener('loadeddata', readyListener);
+                    onDimensionsReady(video.videoWidth, video.videoHeight);
+                } else {
+                    if(attempts < 10) {
+                        attempts++;
+                        setTimeout(findVideoSize, 200);
+                    } else {
+                        onDimensionsReady(640, 480);
+                    }
+                }
+            };
+            var onDimensionsReady = function(width, height) {
+                demo_app(width, height);
+                compatibility.requestAnimationFrame(tick);
+            };
+
+            video.addEventListener('loadeddata', readyListener);
+
+            compatibility.getUserMedia({video: true}, function(stream) {
+                try {
+                    video.src = compatibility.URL.createObjectURL(stream);
+                } catch (error) {
+                    video.src = stream;
+                }
+                setTimeout(function() {
+                        video.play();
+                    }, 500);
+            }, function (error) {
+                $('#canvas').hide();
+                $('#log').hide();
+                $('#no_rtc').html('<h4>WebRTC not available.</h4>');
+                $('#no_rtc').show();
+            });
+        } catch (error) {
+            $('#canvas').hide();
+            $('#log').hide();
+            $('#no_rtc').html('<h4>Something goes wrong...</h4>');
+            $('#no_rtc').show();
+        }
+
+        var stat = new profiler();
+
+        var ctx,canvasWidth,canvasHeight;
+        var img_u8,work_canvas,work_ctx;
+
+        var max_work_size = 160;
+
+        // create a new tracker
+        var cstracker = null;
+
+        function demo_app(videoWidth, videoHeight) {
+            options = new demo_opt();
+
+            canvasWidth  = canvas.width;
+            canvasHeight = canvas.height;
+            ctx = canvas.getContext('2d');
+
+            ctx.fillStyle = "rgb(0,255,0)";
+            ctx.strokeStyle = "rgb(0,255,0)";
+
+            var scale = Math.min(max_work_size/videoWidth, max_work_size/videoHeight);
+            var w = (videoWidth*scale)|0;
+            var h = (videoHeight*scale)|0;
+
+            img_u8 = new jsfeat.matrix_t(w, h, jsfeat.U8_t | jsfeat.C1_t);
+            work_canvas = document.createElement('canvas');
+            work_canvas.width = w;
+            work_canvas.height = h;
+            work_ctx = work_canvas.getContext('2d');
+
+            jsfeat.bbf.prepare_cascade(jsfeat.bbf.face_cascade);
+
+            stat.add("detector");
+            stat.add("track");
+
+
+            cstracker = new headtrackr.camshift.Tracker();
+
+            //init interest points
+            corners_img_u8 = new jsfeat.matrix_t(canvasWidth, canvasHeight, jsfeat.U8_t |
+              jsfeat.C1_t);
+            corners = [];
+            var i = canvasWidth * canvasHeight;
+            while (--i >= 0) {
+              corners[i] = new jsfeat.keypoint_t(0, 0, 0, 0);
+            }
+
+            // var f2 = gui.addFolder('POINTS');
+            // f2.add(options, 'points_per_face', 5, 50).step(5);
+            // f2.add(options, 'show_track_pts', false);
+            // f2.open();
+
+            stat.add("find points");
+
+            //init LK tracker
+            curr_img_pyr = new jsfeat.pyramid_t(3);
+            prev_img_pyr = new jsfeat.pyramid_t(3);
+            curr_img_pyr.allocate(canvasWidth, canvasHeight, jsfeat.U8_t | jsfeat.C1_t);
+            prev_img_pyr.allocate(canvasWidth, canvasHeight, jsfeat.U8_t | jsfeat.C1_t);
+
+            point_count = 0;
+            point_status = new Uint8Array(MAX_POINTS);
+            prev_xy = new Float32Array(MAX_POINTS * 2);
+            curr_xy = new Float32Array(MAX_POINTS * 2);
+
+            // var f3 = gui.addFolder('KLT');
+            // f3.add(options, 'win_size', 7, 30).step(1);
+            // f3.add(options, 'max_iterations', 3, 30).step(1);
+            // f3.add(options, 'epsilon', 0.001, 0.1).step(0.0025);
+            // f3.add(options, 'min_eigen', 0.001, 0.01).step(0.0025);
+
+        }
+
+        /**
+        * Detect faces using BBF algorithm
+        */
+        function detect_bbf() {
+            work_ctx.drawImage(video, 0, 0, work_canvas.width, work_canvas.height);
+            var imageData = work_ctx.getImageData(0, 0, work_canvas.width,
+              work_canvas.height);
+
+            jsfeat.imgproc.grayscale(imageData.data, work_canvas.width, work_canvas
+              .height, img_u8);
+
+            // possible options
+            //jsfeat.imgproc.equalize_histogram(img_u8, img_u8);
+
+            var pyr = jsfeat.bbf.build_pyramid(img_u8, 24 * 2, 24 * 2, 4);
+
+            var rects = jsfeat.bbf.detect(pyr, jsfeat.bbf.face_cascade);
+            rects = jsfeat.bbf.group_rectangles(rects, 1);
+
+            //scale all points
+            var scale = canvasWidth / img_u8.cols;
+            rects = rects.map(function(r) {
+              var nr = Object.assign({}, r);
+              nr.x *= scale;
+              nr.y *= scale;
+              nr.width *= scale;
+              nr.height *= scale;
+              return nr;
+            });
+
+            //trim edges of rect
+            // rects = rects.map(function(r) {
+            //   var nr = Object.assign({}, r);
+            //   nr.x += 20;
+            //   nr.width -= 40;
+            //   nr.y += 10;
+            //   nr.height -= 20;
+            //   return nr;
+            // });
+
+            //move x,y to center of rect
+            // rects = rects.map(function(r) {
+            //   var nr = Object.assign({}, r);
+            //   nr.width -= 20;
+            //   nr.height -= 20;
+            //   nr.x += nr.width/2;
+            //   nr.y += nr.height/2;
+            //   return nr;
+            // });
+
+            jsfeat.math.qsort(rects, 0, rects.length-1, function(a,b){
+                return (b.confidence<a.confidence);
+            });
+
+            return rects;
+        }
+
+        function addPoints(rect) {
+            var scale = 1;
+            point_count = 0;
+            for (var j = 0; j < 50; j++) {
+                var r = Math.random() * Math.min(rect.width, rect.height) * 0.35;
+                var th = Math.random() * 2 * Math.PI;
+                curr_xy[point_count << 1] = ~~(r * Math.cos(th) + rect.x + rect.width/2) * scale;
+                curr_xy[(point_count << 1) + 1] = ~~(r * Math.sin(th) + rect.y + rect.height/2) * scale;
+                point_count++;
+            }
+        }
+
+        /**
+        * track all tracking points using LK optical flow algorithm
+        */
+        function track_lk() {
+            var imageData = ctx.getImageData(0, 0, canvasWidth, canvasHeight);
+
+            // swap flow data
+            var _pt_xy = prev_xy;
+            prev_xy = curr_xy;
+            curr_xy = _pt_xy;
+            var _pyr = prev_img_pyr;
+            prev_img_pyr = curr_img_pyr;
+            curr_img_pyr = _pyr;
+
+            jsfeat.imgproc.grayscale(imageData.data, canvasWidth, canvasHeight, curr_img_pyr.data[0]);
+
+            curr_img_pyr.build(curr_img_pyr.data[0], true);
+
+            jsfeat.optical_flow_lk.track(prev_img_pyr, curr_img_pyr, prev_xy,
+              curr_xy, point_count, options.win_size | 0, options.max_iterations |
+              0, point_status, options.epsilon, options.min_eigen);
+
+            var n = point_count;
+            var i = 0,
+              j = 0;
+
+            for (; i < n; ++i) {
+              if (point_status[i] == 1) {
+                if (j < i) {
+                  curr_xy[j << 1] = curr_xy[i << 1];
+                  curr_xy[(j << 1) + 1] = curr_xy[(i << 1) + 1];
+                }
+                ++j;
+              }
+            }
+            point_count = j;
+
+
+            //update rect params
+            //calculate bb
+            var minx = 999999, 
+                miny = 999999, 
+                maxx = -999999, 
+                maxy = -999999;
+
+            var idx, tx, ty;
+            for (var j = 0; j < point_count; j++) {
+                idx = j;
+                tx = curr_xy[idx << 1];
+                ty = curr_xy[(idx << 1) + 1];
+
+                if (tx < minx) minx = tx;
+                if (ty < miny) miny = ty;
+                if (tx > maxx) maxx = tx;
+                if (ty > maxy) maxy = ty;
+            }
+
+            return {
+                x: minx,
+                y: miny,
+                width: maxx-minx,
+                height: maxy - miny
+            }
+
+
+
+            var new_cx = 0,
+                new_cy = 0;
+
+            for (var j = 0; j < point_count; j++) {
+                var idx = j;
+                new_cx += curr_xy[idx << 1];
+                new_cy += curr_xy[(idx << 1) + 1];
+            }
+
+            new_cx /= point_count;
+            new_cy /= point_count;
+        }
+
+        function track() {
+            cstracker.track(canvas);
+            var currentPos = cstracker.getTrackObj();
+
+
+            var rect = {
+                x: currentPos.x - currentPos.width/2,
+                y: currentPos.y - currentPos.height/2,
+                width: currentPos.width,
+                height: currentPos.height,
+                angle: currentPos.angle
+            }
+
+            //smooth
+            var alpha = 0.2;
+            rect.x = alpha*rect.x + (1-alpha)*theRect.x;
+            rect.y = alpha*rect.y + (1-alpha)*theRect.y;
+            rect.width = alpha*rect.width + (1-alpha)*theRect.width;
+            rect.height = alpha*rect.height + (1-alpha)*theRect.height;
+
+
+            // var rect = {
+            //     x: currentPos.x,
+            //     y: currentPos.y,
+            //     width: currentPos.width,
+            //     height: currentPos.height,
+            //     angle: currentPos.angle
+            // }
+
+            return rect;
+        }
+
+        function track_small() {
+            work_ctx.drawImage(video, 0, 0, work_canvas.width, work_canvas.height);
+            cstracker.track(work_canvas);
+            var currentPos = cstracker.getTrackObj();
+            var scale = canvasWidth / img_u8.cols;
+            var rect = {
+                x: (currentPos.x - currentPos.width/2)*scale,
+                y: (currentPos.y - currentPos.height/2)*scale,
+                width: currentPos.width*scale,
+                height: currentPos.height*scale,
+                angle: currentPos.angle
+            }
+
+            return rect;
+        }
+
+        var mode = 'detect';
+        var rects = [];
+        var theRect = {};
+        var lastDetectTime = 0;
+
+        function tick() {
+            compatibility.requestAnimationFrame(tick);
+            stat.new_frame();
+            if (video.readyState === video.HAVE_ENOUGH_DATA) {
+
+                ctx.drawImage(video, 0, 0, canvasWidth, canvasHeight);
+
+
+                if (mode == 'detect') {
+                    stat.start("detector");
+                    rects = detect_bbf();
+                    stat.stop("detector");
+                    lastDetectTime = Date.now();
+
+                    if (rects.length > 0){
+                        theRect = rects[0];
+                        addPoints(theRect);
+                        // cstracker.initTracker(canvas, 
+                        //     new headtrackr.camshift.Rectangle(
+                        //         Math.floor(theRect.x), 
+                        //         Math.floor(theRect.y), 
+                        //         Math.floor(theRect.width), 
+                        //         Math.floor(theRect.height)
+                        //     )
+                        // );
+
+                        // var scale = canvasWidth / img_u8.cols;
+                        // cstracker.initTracker(work_canvas, 
+                        //     new headtrackr.camshift.Rectangle(
+                        //         Math.floor(theRect.x/scale), 
+                        //         Math.floor(theRect.y/scale), 
+                        //         Math.floor(theRect.width/scale), 
+                        //         Math.floor(theRect.height/scale)
+                        //     )
+                        // );
+                    }
+
+                    mode = 'track';
+                } 
+                if (mode == 'track') {
+                    if ((Date.now() - lastDetectTime) >= options.detects_interval || rects.length == 0) {
+                      mode = 'detect';
+                    } else {
+                        // do track
+                        stat.start("track");
+                        theRect = track_lk();
+                        stat.stop("track");
+                    }
+                } else {
+                    //do nothing
+                }
+
+                if (rects.length > 0){
+                    // draw only most confident one
+                    draw_rect(ctx, rects[0], '#00FF00');
+                    draw_rect(ctx, theRect, '#FF0000');
+                    // draw_faces(ctx, rects, 1.0, 1);
+                    // draw_bodyImage(ctx, theRect);
+                }
+
+                $('#log').html(stat.log());
+            }
+        }
+
+
+        function draw_faces(ctx, rects, sc, max) {
+            var on = rects.length;
+            if(on && max) {
+                jsfeat.math.qsort(rects, 0, on-1, function(a,b){return (b.confidence<a.confidence);})
+            }
+            var n = max || on;
+            n = Math.min(n, on);
+            var r;
+            for(var i = 0; i < n; ++i) {
+                r = rects[i];
+                draw_rect(ctx, r)
+                draw_bodyImage(ctx, r);
+            }
+        }
+
+        function draw_rect(ctx, rect, strokeCol) {
+            ctx.strokeStyle = strokeCol || "rgb(0,255,0)";
+
+            ctx.strokeRect(rect.x, rect.y, rect.width, rect.height);
+        }
+
+        function draw_rect_center(ctx, rect, strokeCol) {
+            ctx.strokeStyle = strokeCol || "rgb(0,255,0)";
+
+            ctx.strokeRect(rect.x-rect.width/2, rect.y-rect.height/2, rect.width, rect.height);
+            // ctx.strokeRect(rect.x, rect.y, rect.width, rect.height);
+        }
+        function draw_bodyImage(ctx, rect) {
+            var bWidth = rect.width * 2,
+                bHeight = rect.height * 2;
+
+            var headPos = {x: 180, y: 0, w: 58, h: 80}; //head center offset in image
+            var scale = rect.width/headPos.w*0.8;
+            // var imgX = rect.x - rect.width/2 - scale*headPos.x,
+            //     imgY = rect.y - rect.height/2 + rect.height*0.2 - scale*headPos.y;
+            var imgX = rect.x - scale*headPos.x,
+                imgY = rect.y + rect.height*0.2 - scale*headPos.y;
+
+            // ctx.drawImage(bodyImg, imgX, imgY);
+            ctx.drawImage(bodyImg, 0, 0, bodyImg.width, bodyImg.height, imgX, imgY, bodyImg.width*scale, bodyImg.height*scale);
+        }
+
+        $(window).unload(function() {
+            video.pause();
+            video.src=null;
+        });
+    });
+    </script>
+</body>
+</html>
