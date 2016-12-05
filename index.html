@@ -63,6 +63,7 @@
         //load image
         var bodyImg = document.createElement('img');
         bodyImg.src = 'img/arnold_body.png';
+        var headPos = {x: 175, y: 0, w: 58, h: 80}; //head center offset in image
 
         getBackCamId(initVideo);
         video.addEventListener("loadedmetadata", function(ev) { 
@@ -98,54 +99,6 @@
               console.log(err);
             });
         }
-
-
-        // try {
-        //     var attempts = 0;
-        //     var readyListener = function(event) {
-        //         findVideoSize();
-        //     };
-        //     var findVideoSize = function() {
-        //         if(video.videoWidth > 0 && video.videoHeight > 0) {
-        //             video.removeEventListener('loadeddata', readyListener);
-        //             onDimensionsReady(video.videoWidth, video.videoHeight);
-        //         } else {
-        //             if(attempts < 10) {
-        //                 attempts++;
-        //                 setTimeout(findVideoSize, 200);
-        //             } else {
-        //                 onDimensionsReady(640, 480);
-        //             }
-        //         }
-        //     };
-        //     var onDimensionsReady = function(width, height) {
-        //         demo_app(width, height);
-        //         compatibility.requestAnimationFrame(tick);
-        //     };
-
-        //     video.addEventListener('loadeddata', readyListener);
-
-        //     compatibility.getUserMedia({video: true}, function(stream) {
-        //         try {
-        //             video.src = compatibility.URL.createObjectURL(stream);
-        //         } catch (error) {
-        //             video.src = stream;
-        //         }
-        //         setTimeout(function() {
-        //                 video.play();
-        //             }, 500);
-        //     }, function (error) {
-        //         $('#canvas').hide();
-        //         $('#log').hide();
-        //         $('#no_rtc').html('<h4>WebRTC not available.</h4>');
-        //         $('#no_rtc').show();
-        //     });
-        // } catch (error) {
-        //     $('#canvas').hide();
-        //     $('#log').hide();
-        //     $('#no_rtc').html('<h4>Something goes wrong...</h4>');
-        //     $('#no_rtc').show();
-        // }
 
         var stat = new profiler();
 
@@ -369,14 +322,14 @@
                 if (ty > maxy) maxy = ty;
             }
 
-            var width = maxx-minx,
-                height = maxy - miny;
+            var width = (maxx-minx)*2,
+                height = (maxy - miny)*2;
 
             return {
-                x: minx - width/4,
-                y: miny - height/4,
-                width: width*2,
-                height: height*2
+                x: Math.round(minx - width/4),
+                y: Math.round(miny - height/4),
+                width: Math.round(width),
+                height: Math.round(height)
             }
 
 
@@ -396,10 +349,15 @@
 
         var mode = 'detect';
         var rects = [];
-        var theRect = {};
+        var theRect = null;
         var lastDetectTime = 0;
 
         function smooth(alpha, or, nr){
+            if (Math.abs(or.width - nr.width) > 500 ||
+                Math.abs(or.height - nr.height) > 500) {
+                return nr;
+            }
+
             return {
                 x: alpha*or.x + (1-alpha)*nr.x,
                 y: alpha*or.y + (1-alpha)*nr.y,
@@ -423,11 +381,15 @@
 
                     if (rects.length > 0){
                         theRect = rects[0];
-                        // theRect = smooth(0.5, theRect, rects[0]);
+                        // if (theRect !== null){
+                        //     theRect = smooth(0.5, theRect, rects[0]);
+                        // } else {
+                        //     theRect = rects[0];
+                        // }
                         addPoints_grid(theRect);
                         lastDetectTime = Date.now();
-                        mode = 'track';
                     }
+                    mode = 'track';
                 } 
                 if (mode == 'track') {
                     if ((Date.now() - lastDetectTime) >= options.detects_interval 
@@ -435,20 +397,21 @@
                         || theRect.width > canvasWidth
                         || theRect.width < 0) {
                       mode = 'detect';
-                    } else {
+                    } 
+                    if (theRect !== null) {
                         // do track
                         stat.start("track");
                         theRect = track_lk();
                         stat.stop("track");
                     }
-                } else {
-                    //do nothing
                 }
 
                 if (rects.length > 0){
+                    // draw_rect(ctx, rects[0], '#00FF00');
+                }
+                if (theRect !== null){
                     draw_bodyImage(ctx, theRect);
-                    draw_rect(ctx, rects[0], '#00FF00');
-                    draw_rect(ctx, theRect, '#FF0000');
+                    // draw_rect(ctx, theRect, '#FF0000');
                     // draw_points(ctx, curr_xy, point_count);
 
                     // draw only most confident one
@@ -506,14 +469,13 @@
             var bWidth = rect.width * 2,
                 bHeight = rect.height * 2 * 1.2;
 
-            var headPos = {x: 185, y: 0, w: 58, h: 80}; //head center offset in image
-            var scale = rect.height/headPos.h;
+            var scale = rect.height/headPos.h*1.2;
             // var scale = rect.width/headPos.w*0.8;
 
             // var imgX = rect.x - rect.width/2 - scale*headPos.x,
             //     imgY = rect.y - rect.height/2 + rect.height*0.2 - scale*headPos.y;
             var imgX = rect.x - scale*headPos.x,
-                imgY = rect.y + rect.height*0.002 - scale*headPos.y;
+                imgY = rect.y + rect.height*0 - scale*headPos.y;
 
             // ctx.drawImage(bodyImg, imgX, imgY);
             ctx.drawImage(bodyImg, 0, 0, bodyImg.width, bodyImg.height, imgX, imgY, bodyImg.width*scale, bodyImg.height*scale);
